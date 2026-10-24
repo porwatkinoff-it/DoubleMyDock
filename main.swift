@@ -164,6 +164,7 @@ func makePanel(level: Int) -> NSPanel {
 final class DockView: NSView {
     unowned let controller: Controller
     var background: NSView!
+    var rim: NSView!               // тонкая светлая кромка, как у Дока
     var hoverU: CGFloat?          // положение курсора вдоль панели (в базовых координатах)
     var lastU: CGFloat = 0
     var mag: CGFloat = 0          // 0…1 — насколько включено увеличение
@@ -255,6 +256,9 @@ final class DockView: NSView {
             return r
         }
         background.frame = barRect.integral
+        rim.frame = barRect.integral
+        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        rim.layer?.borderColor = NSColor.white.withAlphaComponent(dark ? 0.32 : 0.65).cgColor
         needsDisplay = true
     }
 
@@ -293,7 +297,7 @@ final class DockView: NSView {
                 img.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1)
             }
 
-            if it.running {
+            if it.running && it.kind == .app {
                 let ds: CGFloat = max(3, (g.icon * 0.085).rounded())
                 let off = max(1, (g.barThickness - g.icon) / 4 - ds / 2)
                 let dot: CGRect
@@ -676,6 +680,9 @@ final class Controller: NSObject {
             (newItems, newGeo) = fallbackLayout(newPrefs)
         }
 
+        let full = trashIsFull()
+        for i in newItems.indices where newItems[i].kind == .trash { newItems[i].running = full }
+
         if dockScreen == nil { dockScreen = axTrusted ? lastDockScreen : (visibleFrameDockScreen() ?? lastDockScreen) }
         lastDockScreen = dockScreen
 
@@ -725,10 +732,24 @@ final class Controller: NSObject {
         return (list, g)
     }
 
+    /// Полна ли Корзина. Содержимое ~/.Trash закрыто без «Полного доступа к диску»,
+    /// поэтому сначала пробуем список, иначе — число записей в папке через getattrlist.
+    private func trashIsFull() -> Bool {
+        let path = NSHomeDirectory() + "/.Trash"
+        if let items = try? FileManager.default.contentsOfDirectory(atPath: path) {
+            return items.contains { $0 != ".DS_Store" && $0 != ".localized" }
+        }
+        var attrs = attrlist(bitmapcount: u_short(ATTR_BIT_MAP_COUNT), reserved: 0, commonattr: 0,
+                             volattr: 0, dirattr: attrgroup_t(ATTR_DIR_ENTRYCOUNT), fileattr: 0, forkattr: 0)
+        var buf = [UInt32](repeating: 0, count: 2)
+        guard getattrlist(path, &attrs, &buf, MemoryLayout<UInt32>.size * 2, 0) == 0 else { return false }
+        return buf[1] > 1
+    }
+
     func icon(for it: Item) -> NSImage {
         let key: String
         switch it.kind {
-        case .trash: key = "#trash"
+        case .trash: key = it.running ? "#trashFull" : "#trashEmpty"
         case .minimized: key = "#min"
         case .url: key = "#url"
         default: key = it.path ?? "#doc"
@@ -736,7 +757,7 @@ final class Controller: NSObject {
         if let i = iconCache[key] { return i }
         let img: NSImage
         switch it.kind {
-        case .trash: img = NSImage(named: NSImage.trashEmptyName) ?? NSWorkspace.shared.icon(for: .folder)
+        case .trash: img = NSImage(named: it.running ? NSImage.trashFullName : NSImage.trashEmptyName) ?? NSWorkspace.shared.icon(for: .folder)
         case .url: img = NSImage(named: NSImage.networkName) ?? NSWorkspace.shared.icon(for: .internetLocation)
         case .minimized: img = NSImage(named: NSImage.multipleDocumentsName) ?? NSWorkspace.shared.icon(for: .data)
         default: img = it.path.map { NSWorkspace.shared.icon(forFile: $0) } ?? NSWorkspace.shared.icon(for: .data)
@@ -777,9 +798,15 @@ final class Controller: NSObject {
         #else
         bg = Controller.legacyBackground()
         #endif
+        let rim = NSView()
+        rim.wantsLayer = true
+        rim.layer?.borderWidth = 1
+        rim.layer?.cornerCurve = .continuous
         root.addSubview(bg)
+        root.addSubview(rim)
         root.addSubview(view)
         view.background = bg
+        view.rim = rim
         p.contentView = root
         return Mirror(panel: p, view: view)
     }
@@ -792,8 +819,6 @@ final class Controller: NSObject {
         fx.wantsLayer = true
         fx.layer?.masksToBounds = true
         fx.layer?.cornerCurve = .continuous
-        fx.layer?.borderWidth = 0.5
-        fx.layer?.borderColor = NSColor.white.withAlphaComponent(0.2).cgColor
         return fx
     }
 
@@ -836,6 +861,7 @@ final class Controller: NSObject {
             if m.panel.frame != fr { m.panel.setFrame(fr, display: false) }
             if redraw {
                 applyRadius(m.view.background)
+                applyRadius(m.view.rim)
                 m.view.relayout()
             }
             if (autoHide(id) && m.view.hoverU == nil ? 1 : 0) != m.view.hideAmount { startAnimating() }
