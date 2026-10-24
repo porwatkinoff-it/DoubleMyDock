@@ -579,6 +579,7 @@ final class Controller: NSObject {
     private var iconCache: [String: NSImage] = [:]
     private let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
     private var lastDockScreen: CGDirectDisplayID?
+    private var windowDockScreen: CGDirectDisplayID?   // по окну Дока
     private var animTimer: Timer?
     private var bounces: [String: Date] = [:]
     private var hideTimers: [CGDirectDisplayID: Date] = [:]
@@ -701,7 +702,9 @@ final class Controller: NSObject {
         let full = trashIsFull()
         for i in newItems.indices where newItems[i].kind == .trash { newItems[i].running = full }
 
-        if dockScreen == nil { dockScreen = axTrusted ? lastDockScreen : (visibleFrameDockScreen() ?? lastDockScreen) }
+        // окно Дока — главный источник: так копия и Док никогда не окажутся на одном мониторе
+        if let w = windowDockScreen { dockScreen = w }
+        if dockScreen == nil { dockScreen = (axTrusted ? lastDockScreen : visibleFrameDockScreen()) ?? lastDockScreen }
         lastDockScreen = dockScreen
 
         let changed = force || newItems != items || newGeo != geometry || newPrefs != prefs
@@ -908,11 +911,32 @@ final class Controller: NSObject {
 
     /// Как Док в полноэкранном режиме: если окно залезло на место панели — панель прячется.
     @objc private func updateCoverage() {
-        guard !mirrors.isEmpty,
-              let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
                 as? [[String: Any]] else { return }
         let me = ProcessInfo.processInfo.processIdentifier
         let primaryH = NSScreen.screens.first?.frame.height ?? 0
+        // Где сейчас настоящий Док: ищем его окно (уровень Дока, владелец Dock).
+        // Работает и без «Универсального доступа».
+        var realDock: CGDirectDisplayID?
+        for w in list where (w[kCGWindowOwnerName as String] as? String) == "Dock"
+                            && (w[kCGWindowLayer as String] as? Int) == dockLevel {
+            guard let bd = w[kCGWindowBounds as String] as? NSDictionary,
+                  let r = CGRect(dictionaryRepresentation: bd as CFDictionary),
+                  r.width > 20, r.height > 20 else { continue }
+            let c = CGRect(x: r.minX, y: primaryH - r.maxY, width: r.width, height: r.height)
+            if let s = NSScreen.screens.first(where: { $0.frame.contains(CGPoint(x: c.midX, y: c.midY)) }),
+               min(c.width, c.height) < s.frame.height / 3 {
+                realDock = displayID(s)
+                break
+            }
+        }
+        if let realDock { windowDockScreen = realDock }
+        // Два Дока на одном мониторе — сразу убираем копию с него
+        if let realDock, realDock != lastDockScreen {
+            lastDockScreen = realDock
+            layoutPanels(dockScreen: realDock, redraw: true)
+        }
+
         var rects: [CGRect] = []
         for w in list {
             guard (w[kCGWindowLayer as String] as? Int) == 0,
