@@ -588,8 +588,13 @@ final class Controller: NSObject {
     let updater = Updater()
 
     func start() {
-        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        axTrusted = AXIsProcessTrustedWithOptions(opts)
+        axTrusted = AXIsProcessTrusted()
+        if !axTrusted {
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                self?.askForAccessibility()
+            }
+        }
 
         let wnc = NSWorkspace.shared.notificationCenter
         wnc.addObserver(self, selector: #selector(appWillLaunch(_:)), name: NSWorkspace.willLaunchApplicationNotification, object: nil)
@@ -622,7 +627,13 @@ final class Controller: NSObject {
     @objc private func screensChanged() { refresh(force: true) }
     @objc private func tick() {
         ticks += 1
-        if !axTrusted && ticks % 3 == 0 { axTrusted = AXIsProcessTrusted() }
+        if ticks % 3 == 0 {
+            let now = AXIsProcessTrusted()
+            if now != axTrusted {
+                axTrusted = now
+                if now { accessibilityGranted() }
+            }
+        }
         refresh(force: false)
     }
 
@@ -1066,7 +1077,7 @@ final class Controller: NSObject {
             add("Открывать при входе", #selector(toggleLogin)).state =
                 SMAppService.mainApp.status == .enabled ? .on : .off
         }
-        if !axTrusted { add("Разрешить доступ к Доку…", #selector(openAXSettings)) }
+        add(axTrusted ? "Доступ к Доку: есть" : "Доступ к Доку: нет — исправить…", #selector(checkAccessibility))
         m.addItem(.separator())
         if updater.busy {
             add("Обновление…", #selector(noop)).isEnabled = false
@@ -1101,6 +1112,48 @@ final class Controller: NSObject {
         do { if svc.status == .enabled { try svc.unregister() } else { try svc.register() } }
         catch { NSSound.beep() }
     }
+    /// Проверка разрешения «Универсального доступа» с понятной инструкцией.
+    private func askForAccessibility() {
+        guard !AXIsProcessTrusted() else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Разрешите DoubleMyDock доступ к Доку"
+        a.informativeText = """
+        Без него копия работает в упрощённом режиме: не видит папки, свёрнутые окна, \
+        счётчики уведомлений и точный порядок значков.
+
+        В открывшихся настройках включите DoubleMyDock в списке «Универсальный доступ». \
+        Если DoubleMyDock там уже есть, но не работает — удалите его кнопкой «−» и добавьте снова.
+        """
+        a.addButton(withTitle: "Открыть настройки")
+        a.addButton(withTitle: "Позже")
+        if a.runModal() == .alertFirstButtonReturn {
+            // добавляет DoubleMyDock в список настроек, если его там нет
+            let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(opts)
+            openAXSettings()
+        }
+    }
+
+    private func accessibilityGranted() {
+        refresh(force: true)
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Доступ получен"
+        a.informativeText = "Теперь копия повторяет Док полностью."
+        a.runModal()
+    }
+
+    @objc private func checkAccessibility() {
+        if AXIsProcessTrusted() {
+            NSApp.activate(ignoringOtherApps: true)
+            let a = NSAlert()
+            a.messageText = "Доступ к Доку есть"
+            a.informativeText = "Копия повторяет Док полностью."
+            a.runModal()
+        } else { askForAccessibility() }
+    }
+
     @objc private func openAXSettings() {
         if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
             NSWorkspace.shared.open(u)
