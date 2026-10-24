@@ -585,6 +585,16 @@ final class Controller: NSObject {
     private var hideTimers: [CGDirectDisplayID: Date] = [:]
     private var axTrusted = false
     private var covered = Set<CGDirectDisplayID>()   // экраны, где окно залезло на место Дока
+    private var fullscreen = Set<CGDirectDisplayID>() // экраны с полноэкранной программой
+    private var edgeSince: [CGDirectDisplayID: Date] = [:]
+    private var edgeTimers: [CGDirectDisplayID: Timer] = [:]
+
+    /// Сколько курсор должен простоять у края, чтобы скрытая копия выехала.
+    private func revealDelay(_ id: CGDirectDisplayID) -> TimeInterval {
+        if fullscreen.contains(id) { return 5 }      // полноэкранная программа
+        if covered.contains(id) { return 1 }         // окно на месте Дока
+        return 0.5                                   // включено автоскрытие Дока
+    }
     private var ticks = 0
     let updater = Updater()
 
@@ -947,13 +957,15 @@ final class Controller: NSObject {
                   r.width > 60, r.height > 60 else { continue }
             rects.append(CGRect(x: r.minX, y: primaryH - r.maxY, width: r.width, height: r.height))
         }
-        var now = Set<CGDirectDisplayID>()
+        var now = Set<CGDirectDisplayID>(), full = Set<CGDirectDisplayID>()
         for s in NSScreen.screens {
             let id = displayID(s)
             guard mirrors[id] != nil else { continue }
             let zone = baseZone(on: s).insetBy(dx: 2, dy: 2)
             if rects.contains(where: { $0.intersects(zone) }) { now.insert(id) }
+            if rects.contains(where: { $0.contains(s.frame.insetBy(dx: 4, dy: 4)) }) { full.insert(id) }
         }
+        fullscreen = full
         if now != covered {
             covered = now
             startAnimating()
@@ -979,11 +991,29 @@ final class Controller: NSObject {
             let sf = m.panel.screen?.frame ?? .zero
             let atEdge: Bool
             switch g.orientation {
-            case .bottom: atEdge = p.y <= sf.minY + 2 && p.x >= sf.minX && p.x <= sf.maxX
-            case .left:   atEdge = p.x <= sf.minX + 2 && p.y >= sf.minY && p.y <= sf.maxY
-            case .right:  atEdge = p.x >= sf.maxX - 3 && p.y >= sf.minY && p.y <= sf.maxY
+            // только внутри этого экрана: курсор на соседнем мониторе ниже края не считается
+            case .bottom: atEdge = p.y >= sf.minY && p.y <= sf.minY + 2 && p.x >= sf.minX && p.x < sf.maxX
+            case .left:   atEdge = p.x >= sf.minX && p.x <= sf.minX + 2 && p.y >= sf.minY && p.y < sf.maxY
+            case .right:  atEdge = p.x < sf.maxX && p.x >= sf.maxX - 3 && p.y >= sf.minY && p.y < sf.maxY
             }
-            let inside = (zone.contains(local) && v.hideAmount < 0.5) || (autoHide(id) && atEdge && v.hideAmount > 0.3)
+            // скрытая копия выезжает, только если курсор задержался у края (а не пролетел мимо)
+            var edgeReveal = false
+            if autoHide(id) && atEdge && v.hideAmount > 0.3 {
+                let delay = revealDelay(id)
+                if let since = edgeSince[id] {
+                    edgeReveal = Date().timeIntervalSince(since) >= delay
+                } else {
+                    edgeSince[id] = Date()
+                    edgeTimers[id]?.invalidate()
+                    edgeTimers[id] = Timer.scheduledTimer(timeInterval: delay + 0.05, target: self,
+                                                          selector: #selector(edgeCheck), userInfo: nil, repeats: false)
+                }
+            } else {
+                edgeSince[id] = nil
+                edgeTimers[id]?.invalidate()
+                edgeTimers[id] = nil
+            }
+            let inside = (zone.contains(local) && v.hideAmount < 0.5) || edgeReveal
 
             if inside {
                 let axisLen = g.orientation == .bottom ? v.bounds.width : v.bounds.height
@@ -1003,6 +1033,8 @@ final class Controller: NSObject {
         }
         if needAnim { startAnimating() }
     }
+
+    @objc private func edgeCheck() { mouseMoved() }
 
     private func startAnimating() {
         guard animTimer == nil else { return }
