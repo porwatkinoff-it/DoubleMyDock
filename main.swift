@@ -143,6 +143,63 @@ final class DockReader {
         return (items, frames, listFrame)
     }
 
+    struct MenuNode {
+        var title: String
+        var enabled: Bool
+        var mark: String
+        var children: [MenuNode]
+    }
+
+    /// Найти элемент настоящего Дока для нашего значка (индекс мог сдвинуться).
+    private func element(for item: Item) -> AXUIElement? {
+        if item.axIndex >= 0, item.axIndex < elements.count,
+           (str(elements[item.axIndex], kAXTitleAttribute) ?? "") == item.title { return elements[item.axIndex] }
+        return elements.first { (str($0, kAXTitleAttribute) ?? "") == item.title }
+    }
+
+    private func openMenu(_ e: AXUIElement) -> AXUIElement? {
+        AXUIElementPerformAction(e, kAXShowMenuAction as CFString)
+        for _ in 0..<40 {
+            if let m = children(e).first(where: { str($0, kAXRoleAttribute) == kAXMenuRole }) { return m }
+            usleep(8_000)
+        }
+        return nil
+    }
+
+    private func nodes(_ menu: AXUIElement) -> [MenuNode] {
+        children(menu).compactMap { mi in
+            guard str(mi, kAXRoleAttribute) == kAXMenuItemRole else { return nil }
+            let sub = children(mi).first { str($0, kAXRoleAttribute) == kAXMenuRole }
+            return MenuNode(title: str(mi, kAXTitleAttribute) ?? "",
+                            enabled: (copy(mi, kAXEnabledAttribute) as? NSNumber)?.boolValue ?? true,
+                            mark: str(mi, kAXMenuItemMarkCharAttribute) ?? "",
+                            children: sub.map { nodes($0) } ?? [])
+        }
+    }
+
+    /// Открывает меню у настоящего Дока, читает все пункты и сразу закрывает.
+    func readMenu(for item: Item) -> [MenuNode]? {
+        guard let e = element(for: item), let menu = openMenu(e) else { return nil }
+        let result = nodes(menu)
+        AXUIElementPerformAction(menu, kAXCancelAction as CFString)
+        return result.isEmpty ? nil : result
+    }
+
+    /// Нажимает пункт меню настоящего Дока по пути заголовков.
+    func pressMenu(for item: Item, path: [String]) {
+        guard let e = element(for: item), var menu = openMenu(e) else { return }
+        for (depth, title) in path.enumerated() {
+            guard let mi = children(menu).first(where: { (str($0, kAXTitleAttribute) ?? "") == title }) else { break }
+            if depth == path.count - 1 {
+                AXUIElementPerformAction(mi, kAXPressAction as CFString)
+                return
+            }
+            guard let sub = children(mi).first(where: { str($0, kAXRoleAttribute) == kAXMenuRole }) else { break }
+            menu = sub
+        }
+        AXUIElementPerformAction(menu, kAXCancelAction as CFString)
+    }
+
     func press(_ index: Int) {
         guard index >= 0, index < elements.count else { return }
         AXUIElementPerformAction(elements[index], kAXPressAction as CFString)
@@ -1112,6 +1169,68 @@ final class Controller: NSObject {
         NSWorkspace.shared.runningApplications.first { $0.bundleURL?.standardizedFileURL.path == path }
     }
 
+    /// Меню значка — то же, что у настоящего Дока (берём его пункты через Accessibility).
+    private func dockMenu(for it: Item) -> NSMenu {
+        if axTrusted, let nodes = reader.readMenu(for: it) {
+            let m = NSMenu()
+            m.autoenablesItems = false
+            func build(_ list: [DockReader.MenuNode], into menu: NSMenu, path: [String]) {
+                for n in list {
+                    if n.title.isEmpty && n.children.isEmpty { menu.addItem(.separator()); continue }
+                    let mi = NSMenuItem(title: n.title, action: #selector(dockMenuPick(_:)), keyEquivalent: "")
+                    mi.target = self
+                    mi.isEnabled = n.enabled
+                    mi.state = n.mark.isEmpty ? .off : .on
+                    mi.representedObject = DockPick(item: it, path: path + [n.title])
+                    if !n.children.isEmpty {
+                        let sub = NSMenu(title: n.title)
+                        sub.autoenablesItems = false
+                        build(n.children, into: sub, path: path + [n.title])
+                        mi.submenu = sub
+                        mi.action = nil
+                    }
+                    menu.addItem(mi)
+                }
+            }
+            build(nodes, into: m, path: [])
+            return m
+        }
+        // Без Accessibility — меню, похожее на Док
+        let m = NSMenu()
+        m.autoenablesItems = false
+        func item(_ title: String, _ sel: Selector, _ obj: Any?, in menu: NSMenu) {
+            let mi = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = obj
+            menu.addItem(mi)
+        }
+        if let p = it.path {
+            let opts = NSMenu(title: "Параметры")
+            item("Показать в Finder", #selector(reveal(_:)), p, in: opts)
+            let o = NSMenuItem(title: "Параметры", action: nil, keyEquivalent: "")
+            o.submenu = opts
+            m.addItem(o)
+            m.addItem(.separator())
+            if it.kind == .app, let app = runningApp(p) {
+                item(app.isHidden ? "Показать" : "Скрыть", #selector(toggleHidden(_:)), p, in: m)
+                if p != finderPath { item("Завершить", #selector(quitApp(_:)), p, in: m) }
+            } else {
+                item("Открыть", #selector(openPath(_:)), p, in: m)
+            }
+        }
+        return m
+    }
+
+    final class DockPick: NSObject {
+        let item: Item, path: [String]
+        init(item: Item, path: [String]) { self.item = item; self.path = path }
+    }
+
+    @objc private func dockMenuPick(_ s: NSMenuItem) {
+        guard let pick = s.representedObject as? DockPick else { return }
+        reader.pressMenu(for: pick.item, path: pick.path)
+    }
+
     func menu(for it: Item?) -> NSMenu {
         let m = NSMenu()
         m.autoenablesItems = false
@@ -1123,16 +1242,7 @@ final class Controller: NSObject {
             m.addItem(mi)
             return mi
         }
-        if let it, let p = it.path {
-            if it.kind == .app, let app = runningApp(p) {
-                add(app.isHidden ? "Показать" : "Скрыть", #selector(toggleHidden(_:)), p)
-                if p != finderPath { add("Завершить", #selector(quitApp(_:)), p) }
-            } else if it.kind == .app {
-                add("Открыть", #selector(openPath(_:)), p)
-            }
-            add("Показать в Finder", #selector(reveal(_:)), p)
-            m.addItem(.separator())
-        }
+        if let it { return dockMenu(for: it) }
         if #available(macOS 13.0, *) {
             add("Открывать при входе", #selector(toggleLogin)).state =
                 SMAppService.mainApp.status == .enabled ? .on : .off
@@ -1160,7 +1270,7 @@ final class Controller: NSObject {
     }
     @objc private func openPath(_ s: NSMenuItem) {
         guard let p = s.representedObject as? String else { return }
-        NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: p), configuration: NSWorkspace.OpenConfiguration())
+        NSWorkspace.shared.open(URL(fileURLWithPath: p))
     }
     @objc private func reveal(_ s: NSMenuItem) {
         guard let p = s.representedObject as? String else { return }
