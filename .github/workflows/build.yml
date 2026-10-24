@@ -5,6 +5,10 @@ on:
     branches: [main]
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия релиза, например v2.0.0 (пусто — без релиза)"
+        required: false
 
 permissions:
   contents: write
@@ -41,9 +45,10 @@ jobs:
           path: dist/DoubleMyDock.dmg
 
       - name: Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || inputs.version != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version || github.ref_name }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/DoubleMyDock.dmg \
-            --title "DoubleMyDock $GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md
+          gh release create "$VERSION" dist/DoubleMyDock.dmg --target "$GITHUB_SHA" \
+            --title "DoubleMyDock $VERSION" --notes-file RELEASE_NOTES.md
