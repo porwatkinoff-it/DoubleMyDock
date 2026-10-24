@@ -16,6 +16,7 @@ swiftc -O -target arm64-apple-macos13 -o "$BUILD/arm64" main.swift
 swiftc -O -target x86_64-apple-macos13 -o "$BUILD/x86_64" main.swift
 lipo -create "$BUILD/arm64" "$BUILD/x86_64" -output "$APP/Contents/MacOS/$NAME"
 cp Info.plist "$APP/Contents/Info.plist"
+cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 codesign --force --sign - "$APP" >/dev/null 2>&1
 
 echo "Делаю $DMG…"

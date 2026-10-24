@@ -154,7 +154,7 @@ func makePanel(level: Int) -> NSPanel {
     p.hasShadow = false
     p.hidesOnDeactivate = false
     p.isReleasedWhenClosed = false
-    p.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+    p.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
     return p
 }
 
@@ -438,6 +438,7 @@ final class Controller: NSObject {
     private var bounces: [String: Date] = [:]
     private var hideTimers: [CGDirectDisplayID: Date] = [:]
     private var axTrusted = false
+    private var covered = Set<CGDirectDisplayID>()   // экраны, где окно залезло на место Дока
     private var ticks = 0
 
     func start() {
@@ -457,8 +458,14 @@ final class Controller: NSObject {
             MainActor.assumeIsolated { self?.mouseMoved() }
             return e
         }
+        wnc.addObserver(self, selector: #selector(updateCoverage),
+                        name: NSWorkspace.didActivateApplicationNotification, object: nil)
+        wnc.addObserver(self, selector: #selector(updateCoverage),
+                        name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         let t = Timer.scheduledTimer(timeInterval: 1, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
         t.tolerance = 0.3
+        let c = Timer.scheduledTimer(timeInterval: 0.4, target: self, selector: #selector(updateCoverage), userInfo: nil, repeats: true)
+        c.tolerance = 0.2
         refresh(force: true)
     }
 
@@ -533,7 +540,7 @@ final class Controller: NSObject {
             (newItems, newGeo) = fallbackLayout(newPrefs)
         }
 
-        if dockScreen == nil { dockScreen = visibleFrameDockScreen() ?? lastDockScreen }
+        if dockScreen == nil { dockScreen = axTrusted ? lastDockScreen : (visibleFrameDockScreen() ?? lastDockScreen) }
         lastDockScreen = dockScreen
 
         let changed = force || newItems != items || newGeo != geometry || newPrefs != prefs
@@ -627,6 +634,8 @@ final class Controller: NSObject {
         #if compiler(>=6.2)
         if #available(macOS 26.0, *) {
             let glass = NSGlassEffectView()        // то же «жидкое стекло», что у Дока в Tahoe
+            glass.style = .clear
+            glass.contentView = NSView()
             bg = glass
         } else { bg = Controller.legacyBackground() }
         #else
@@ -683,17 +692,64 @@ final class Controller: NSObject {
                 continue
             }
             let m: Mirror
-            if let e = mirrors[id] { m = e } else { m = makeMirror(); mirrors[id] = m }
+            if let e = mirrors[id] { m = e } else {
+                m = makeMirror(); mirrors[id] = m
+                m.view.hideAmount = prefs.autohide ? 1 : 0
+            }
             let fr = panelFrame(on: s)
             if m.panel.frame != fr { m.panel.setFrame(fr, display: false) }
             if redraw {
                 applyRadius(m.view.background)
-                if prefs.autohide && m.view.hoverU == nil { m.view.hideAmount = 1 } else if !prefs.autohide { m.view.hideAmount = 0 }
                 m.view.relayout()
             }
+            if (autoHide(id) && m.view.hoverU == nil ? 1 : 0) != m.view.hideAmount { startAnimating() }
             if !m.panel.isVisible { m.panel.orderFrontRegardless() }
         }
         for (id, m) in mirrors where !seen.contains(id) { m.panel.orderOut(nil); mirrors[id] = nil }
+    }
+
+    // MARK: окна поверх места Дока
+
+    private func autoHide(_ id: CGDirectDisplayID) -> Bool { prefs.autohide || covered.contains(id) }
+
+    /// Где стоит панель (без учёта увеличения и скрытия), в координатах экрана.
+    private func baseZone(on s: NSScreen) -> CGRect {
+        let f = s.frame, g = geometry, t = g.gap + g.barThickness
+        switch g.orientation {
+        case .bottom: return CGRect(x: f.midX - g.barLength / 2, y: f.minY, width: g.barLength, height: t)
+        case .left:   return CGRect(x: f.minX, y: f.midY - g.barLength / 2, width: t, height: g.barLength)
+        case .right:  return CGRect(x: f.maxX - t, y: f.midY - g.barLength / 2, width: t, height: g.barLength)
+        }
+    }
+
+    /// Как Док в полноэкранном режиме: если окно залезло на место панели — панель прячется.
+    @objc private func updateCoverage() {
+        guard !mirrors.isEmpty,
+              let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]] else { return }
+        let me = ProcessInfo.processInfo.processIdentifier
+        let primaryH = NSScreen.screens.first?.frame.height ?? 0
+        var rects: [CGRect] = []
+        for w in list {
+            guard (w[kCGWindowLayer as String] as? Int) == 0,
+                  (w[kCGWindowOwnerPID as String] as? Int32) != me,
+                  ((w[kCGWindowAlpha as String] as? Double) ?? 1) > 0.05,
+                  let bd = w[kCGWindowBounds as String] as? NSDictionary,
+                  let r = CGRect(dictionaryRepresentation: bd as CFDictionary),
+                  r.width > 60, r.height > 60 else { continue }
+            rects.append(CGRect(x: r.minX, y: primaryH - r.maxY, width: r.width, height: r.height))
+        }
+        var now = Set<CGDirectDisplayID>()
+        for s in NSScreen.screens {
+            let id = displayID(s)
+            guard mirrors[id] != nil else { continue }
+            let zone = baseZone(on: s).insetBy(dx: 2, dy: 2)
+            if rects.contains(where: { $0.intersects(zone) }) { now.insert(id) }
+        }
+        if now != covered {
+            covered = now
+            startAnimating()
+        }
     }
 
     // MARK: наведение, увеличение, автоскрытие
@@ -719,7 +775,7 @@ final class Controller: NSObject {
             case .left:   atEdge = p.x <= sf.minX + 2 && p.y >= sf.minY && p.y <= sf.maxY
             case .right:  atEdge = p.x >= sf.maxX - 3 && p.y >= sf.minY && p.y <= sf.maxY
             }
-            let inside = zone.contains(local) || (prefs.autohide && atEdge && v.hideAmount > 0.5)
+            let inside = (zone.contains(local) && v.hideAmount < 0.5) || (autoHide(id) && atEdge && v.hideAmount > 0.3)
 
             if inside {
                 let axisLen = g.orientation == .bottom ? v.bounds.width : v.bounds.height
@@ -732,7 +788,7 @@ final class Controller: NSObject {
                 v.relayout()
             } else if v.hoverU != nil {
                 v.hoverU = nil
-                if prefs.autohide { hideTimers[id] = Date() }
+                if autoHide(id) { hideTimers[id] = Date() }
                 needAnim = true
                 v.needsDisplay = true
             }
@@ -754,7 +810,7 @@ final class Controller: NSObject {
             let v = m.view
             let targetMag: CGFloat = (v.hoverU != nil && prefs.magnification) ? 1 : 0
             var targetHide: CGFloat = 0
-            if prefs.autohide {
+            if autoHide(id) {
                 if v.hoverU != nil { targetHide = 0 }
                 else if let t = hideTimers[id], now.timeIntervalSince(t) < 0.35 { targetHide = 0; busy = true }
                 else { targetHide = 1 }
