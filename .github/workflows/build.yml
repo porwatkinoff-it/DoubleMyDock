@@ -13,7 +13,7 @@ jobs:
   build:
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Select newest Xcode
         run: |
@@ -23,9 +23,19 @@ jobs:
           swiftc --version
 
       - name: Build
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee build.log
 
-      - uses: actions/upload-artifact@v4
+      - name: Report errors
+        if: failure()
+        run: |
+          grep -E "error:|warning: .*(isolated|Sendable)" build.log | head -20 | while IFS= read -r l; do
+            echo "::error::${l//$'\n'/ }"
+          done
+          tail -5 build.log | while IFS= read -r l; do echo "::warning::$l"; done
+
+      - uses: actions/upload-artifact@v5
         with:
           name: DoubleMyDock
           path: dist/DoubleMyDock.dmg
