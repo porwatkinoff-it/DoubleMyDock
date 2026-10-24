@@ -420,6 +420,140 @@ final class DockView: NSView {
     }
 }
 
+
+// MARK: - Обновления с GitHub
+
+@MainActor
+final class Updater {
+    static let repo = "porwatkinoff-it/DoubleMyDock"
+    private(set) var available: (version: String, url: URL)?
+    private(set) var busy = false
+    private var lastPrompted: String? {
+        get { UserDefaults.standard.string(forKey: "lastPromptedVersion") }
+        set { UserDefaults.standard.set(newValue, forKey: "lastPromptedVersion") }
+    }
+
+    var current: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0" }
+
+    func start() {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            self?.check(userInitiated: false)
+        }
+        let t = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.check(userInitiated: false) }
+        }
+        t.tolerance = 600
+    }
+
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        func parts(_ s: String) -> [Int] {
+            s.trimmingCharacters(in: CharacterSet(charactersIn: "vV")).split(separator: ".").map { Int($0) ?? 0 }
+        }
+        let x = parts(a), y = parts(b)
+        for i in 0..<max(x.count, y.count) {
+            let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+            if p != q { return p > q }
+        }
+        return false
+    }
+
+    func check(userInitiated: Bool) {
+        guard !busy else { return }
+        Task {
+            do {
+                var req = URLRequest(url: URL(string: "https://api.github.com/repos/\(Updater.repo)/releases/latest")!)
+                req.setValue("DoubleMyDock", forHTTPHeaderField: "User-Agent")
+                req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+                let (data, _) = try await URLSession.shared.data(for: req)
+                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let tag = json["tag_name"] as? String,
+                      let assets = json["assets"] as? [[String: Any]],
+                      let dmg = assets.first(where: { ($0["name"] as? String)?.hasSuffix(".dmg") == true }),
+                      let s = dmg["browser_download_url"] as? String, let url = URL(string: s)
+                else { throw URLError(.badServerResponse) }
+                let version = tag.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
+                if Updater.isNewer(version, than: current) {
+                    available = (version, url)
+                    if userInitiated || lastPrompted != version {
+                        lastPrompted = version
+                        prompt(version)
+                    }
+                } else {
+                    available = nil
+                    if userInitiated { info("Установлена последняя версия", "DoubleMyDock \(current) — самая новая.") }
+                }
+            } catch {
+                if userInitiated { info("Не удалось проверить обновления", error.localizedDescription) }
+            }
+        }
+    }
+
+    private func prompt(_ version: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = "Доступна новая версия DoubleMyDock \(version)"
+        a.informativeText = "Сейчас установлена \(current). Обновление скачается и установится само, программа перезапустится."
+        a.addButton(withTitle: "Обновить")
+        a.addButton(withTitle: "Позже")
+        if a.runModal() == .alertFirstButtonReturn { install() }
+    }
+
+    private func info(_ title: String, _ text: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        a.runModal()
+    }
+
+    func install() {
+        guard let av = available, !busy else { return }
+        let version = av.version, url = av.url
+        busy = true
+        Task {
+            do {
+                let (tmp, _) = try await URLSession.shared.download(from: url)
+                let dir = FileManager.default.temporaryDirectory.appendingPathComponent("DoubleMyDock-\(version)")
+                try? FileManager.default.removeItem(at: dir)
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                let dmg = dir.appendingPathComponent("DoubleMyDock.dmg")
+                try FileManager.default.moveItem(at: tmp, to: dmg)
+                let mnt = dir.appendingPathComponent("mnt")
+
+                let attach = Process()
+                attach.executableURL = URL(fileURLWithPath: "/usr/bin/hdiutil")
+                attach.arguments = ["attach", dmg.path, "-nobrowse", "-quiet", "-mountpoint", mnt.path]
+                try attach.run()
+                attach.waitUntilExit()
+                let newApp = mnt.appendingPathComponent("DoubleMyDock.app")
+                guard attach.terminationStatus == 0, FileManager.default.fileExists(atPath: newApp.path)
+                else { throw CocoaError(.fileReadCorruptFile) }
+
+                // Заменяем себя после выхода и перезапускаемся
+                let dest = Bundle.main.bundleURL.path
+                let script = """
+                while kill -0 $1 2>/dev/null; do sleep 0.2; done
+                rm -rf "$3.old"
+                if mv "$3" "$3.old" && ditto "$2" "$3"; then rm -rf "$3.old"; else rm -rf "$3"; mv "$3.old" "$3"; fi
+                xattr -dr com.apple.quarantine "$3" 2>/dev/null
+                hdiutil detach "$4" -quiet
+                open "$3"
+                """
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/bin/sh")
+                p.arguments = ["-c", script, "sh", String(ProcessInfo.processInfo.processIdentifier),
+                               newApp.path, dest, mnt.path]
+                try p.run()
+                NSApp.terminate(nil)
+            } catch {
+                busy = false
+                info("Не удалось обновить", error.localizedDescription)
+            }
+        }
+    }
+}
+
 // MARK: - Контроллер
 
 @MainActor
@@ -440,6 +574,7 @@ final class Controller: NSObject {
     private var axTrusted = false
     private var covered = Set<CGDirectDisplayID>()   // экраны, где окно залезло на место Дока
     private var ticks = 0
+    let updater = Updater()
 
     func start() {
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -467,6 +602,7 @@ final class Controller: NSObject {
         let c = Timer.scheduledTimer(timeInterval: 0.4, target: self, selector: #selector(updateCoverage), userInfo: nil, repeats: true)
         c.tolerance = 0.2
         refresh(force: true)
+        updater.start()
     }
 
     // MARK: события
@@ -870,6 +1006,7 @@ final class Controller: NSObject {
 
     func menu(for it: Item?) -> NSMenu {
         let m = NSMenu()
+        m.autoenablesItems = false
         @discardableResult
         func add(_ title: String, _ sel: Selector, _ obj: Any? = nil) -> NSMenuItem {
             let mi = NSMenuItem(title: title, action: sel, keyEquivalent: "")
@@ -893,6 +1030,14 @@ final class Controller: NSObject {
                 SMAppService.mainApp.status == .enabled ? .on : .off
         }
         if !axTrusted { add("Разрешить доступ к Доку…", #selector(openAXSettings)) }
+        m.addItem(.separator())
+        if updater.busy {
+            add("Обновление…", #selector(noop)).isEnabled = false
+        } else if let a = updater.available {
+            add("Обновить до \(a.version)", #selector(installUpdate))
+        } else {
+            add("Проверить обновления", #selector(checkUpdates))
+        }
         add("Выйти из DoubleMyDock", #selector(quitSelf))
         return m
     }
@@ -924,6 +1069,9 @@ final class Controller: NSObject {
             NSWorkspace.shared.open(u)
         }
     }
+    @objc private func checkUpdates() { updater.check(userInitiated: true) }
+    @objc private func installUpdate() { updater.install() }
+    @objc private func noop() {}
     @objc private func quitSelf() { NSApp.terminate(nil) }
 }
 
