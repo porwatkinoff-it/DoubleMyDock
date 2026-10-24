@@ -19,7 +19,7 @@ jobs:
         run: |
           X=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
           sudo xcode-select -s "$X"
-          xcodebuild -version
+          echo "::notice::$(xcodebuild -version | head -1), $(swiftc --version 2>&1 | head -1)"
           swiftc --version
 
       - name: Build
