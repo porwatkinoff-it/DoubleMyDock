@@ -48,6 +48,8 @@ struct DockPrefs: Equatable {
     var autohide = false
     var orientation: Orientation = .bottom
     var pinned: [String] = []
+    var recents: [String] = []
+    var showRecents = true
 
     static func read() -> DockPrefs {
         let d = "com.apple.dock" as CFString
@@ -59,15 +61,20 @@ struct DockPrefs: Equatable {
         if let n = v("largesize") as? NSNumber { p.large = min(max(CGFloat(n.doubleValue), p.tile), 128) }
         p.autohide = (v("autohide") as? NSNumber)?.boolValue ?? false
         p.orientation = Orientation(rawValue: (v("orientation") as? String) ?? "bottom") ?? .bottom
-        if let arr = v("persistent-apps") as? [[String: Any]] {
-            for e in arr {
+        func paths(_ key: String) -> [String] {
+            guard let arr = v(key) as? [[String: Any]] else { return [] }
+            return arr.compactMap { e in
                 guard let t = e["tile-data"] as? [String: Any],
                       let f = t["file-data"] as? [String: Any],
-                      let s = f["_CFURLString"] as? String else { continue }
+                      let s = f["_CFURLString"] as? String else { return nil }
                 let u = s.hasPrefix("/") ? URL(fileURLWithPath: s) : URL(string: s)
-                if let u, u.isFileURL { p.pinned.append(u.standardizedFileURL.path) }
+                guard let u, u.isFileURL else { return nil }
+                return u.standardizedFileURL.path
             }
         }
+        p.pinned = paths("persistent-apps")
+        p.recents = paths("recent-apps")
+        p.showRecents = (v("show-recents") as? NSNumber)?.boolValue ?? true
         return p
     }
 }
@@ -699,8 +706,12 @@ final class Controller: NSObject {
             .compactMap { $0.bundleURL?.standardizedFileURL.path }
         let runSet = Set(running)
         let pinned = [finderPath] + p.pinned.filter { $0 != finderPath && FileManager.default.fileExists(atPath: $0) }
+        // как у Дока: запущенные незакреплённые + недавние программы
         var extra: [String] = []
-        for r in running where !pinned.contains(r) && !extra.contains(r) { extra.append(r) }
+        let recent = p.showRecents ? p.recents.filter { FileManager.default.fileExists(atPath: $0) } : []
+        for r in recent + running where !pinned.contains(r) && !extra.contains(r) {
+            if recent.contains(r) || runSet.contains(r) { extra.append(r) }
+        }
         func app(_ path: String) -> Item {
             var name = FileManager.default.displayName(atPath: path)
             if name.hasSuffix(".app") { name.removeLast(4) }
