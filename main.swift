@@ -602,8 +602,12 @@ final class Controller: NSObject {
         axTrusted = AXIsProcessTrusted()
         if !axTrusted {
             Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
-                self?.askForAccessibility()
+                // macOS иногда отвечает «нет» в первые секунды после запуска — перепроверяем
+                for _ in 0..<8 {
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    if AXIsProcessTrusted() { return }
+                }
+                self?.askForAccessibility(atLaunch: true)
             }
         }
 
@@ -1169,26 +1173,43 @@ final class Controller: NSObject {
         catch { NSSound.beep() }
     }
     /// Проверка разрешения «Универсального доступа» с понятной инструкцией.
-    private func askForAccessibility() {
+    private func askForAccessibility(atLaunch: Bool = false) {
         guard !AXIsProcessTrusted() else { return }
+        if atLaunch && UserDefaults.standard.bool(forKey: "dontAskAccessibility") { return }
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
-        a.messageText = "Разрешите DoubleMyDock доступ к Доку"
+        a.messageText = "Нужен доступ к Доку"
         a.informativeText = """
         Без него копия работает в упрощённом режиме: не видит папки, свёрнутые окна, \
         счётчики уведомлений и точный порядок значков.
 
-        В открывшихся настройках включите DoubleMyDock в списке «Универсальный доступ». \
-        Если DoubleMyDock там уже есть, но не работает — удалите его кнопкой «−» и добавьте снова.
+        Нажмите «Исправить»: DoubleMyDock удалит старую запись (если она осталась от прошлой версии), \
+        добавит себя заново и откроет настройки. Там останется включить переключатель у DoubleMyDock.
         """
-        a.addButton(withTitle: "Открыть настройки")
+        a.addButton(withTitle: "Исправить")
         a.addButton(withTitle: "Позже")
-        if a.runModal() == .alertFirstButtonReturn {
-            // добавляет DoubleMyDock в список настроек, если его там нет
-            let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary
-            _ = AXIsProcessTrustedWithOptions(opts)
-            openAXSettings()
+        if atLaunch {
+            a.showsSuppressionButton = true
+            a.suppressionButton?.title = "Больше не показывать"
         }
+        let r = a.runModal()
+        if atLaunch, a.suppressionButton?.state == .on {
+            UserDefaults.standard.set(true, forKey: "dontAskAccessibility")
+        }
+        guard r == .alertFirstButtonReturn else { return }
+
+        // старая запись от прошлой подписи выглядит включённой, но не действует — сбрасываем её
+        if let id = Bundle.main.bundleIdentifier {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+            p.arguments = ["reset", "Accessibility", id]
+            try? p.run()
+            p.waitUntilExit()
+        }
+        // добавляем себя в список заново
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: false] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(opts)
+        openAXSettings()
     }
 
     private func accessibilityGranted() {
@@ -1207,7 +1228,10 @@ final class Controller: NSObject {
             a.messageText = "Доступ к Доку есть"
             a.informativeText = "Копия повторяет Док полностью."
             a.runModal()
-        } else { askForAccessibility() }
+        } else {
+            UserDefaults.standard.set(false, forKey: "dontAskAccessibility")
+            askForAccessibility()
+        }
     }
 
     @objc private func openAXSettings() {
