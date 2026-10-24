@@ -167,7 +167,7 @@ final class DockView: NSView {
     var hoverU: CGFloat?          // положение курсора вдоль панели (в базовых координатах)
     var lastU: CGFloat = 0
     var mag: CGFloat = 0          // 0…1 — насколько включено увеличение
-    var hidden: CGFloat = 0       // 0…1 — для автоскрытия
+    var hideAmount: CGFloat = 0       // 0…1 — для автоскрытия
     var pressedIndex: Int?
     var dropIndex: Int?
 
@@ -234,7 +234,7 @@ final class DockView: NSView {
         // база вдоль оси: панель по центру экрана
         let axisLen = g.orientation == .bottom ? bounds.width : bounds.height
         let base = ((axisLen - g.barLength) / 2).rounded()
-        let edgeOff = g.gap - hidden * (g.gap + g.barThickness + 2)
+        let edgeOff = g.gap - hideAmount * (g.gap + g.barThickness + 2)
         let baseline = (g.barThickness - s) / 2
 
         func rect(along a: CGFloat, _ len: CGFloat, cross c: CGFloat, _ clen: CGFloat) -> CGRect {
@@ -688,7 +688,7 @@ final class Controller: NSObject {
             if m.panel.frame != fr { m.panel.setFrame(fr, display: false) }
             if redraw {
                 applyRadius(m.view.background)
-                if prefs.autohide && m.view.hoverU == nil { m.view.hidden = 1 } else if !prefs.autohide { m.view.hidden = 0 }
+                if prefs.autohide && m.view.hoverU == nil { m.view.hideAmount = 1 } else if !prefs.autohide { m.view.hideAmount = 0 }
                 m.view.relayout()
             }
             if !m.panel.isVisible { m.panel.orderFrontRegardless() }
@@ -719,7 +719,7 @@ final class Controller: NSObject {
             case .left:   atEdge = p.x <= sf.minX + 2 && p.y >= sf.minY && p.y <= sf.maxY
             case .right:  atEdge = p.x >= sf.maxX - 3 && p.y >= sf.minY && p.y <= sf.maxY
             }
-            let inside = zone.contains(local) || (prefs.autohide && atEdge && v.hidden > 0.5)
+            let inside = zone.contains(local) || (prefs.autohide && atEdge && v.hideAmount > 0.5)
 
             if inside {
                 let axisLen = g.orientation == .bottom ? v.bounds.width : v.bounds.height
@@ -761,10 +761,10 @@ final class Controller: NSObject {
             }
             let step: CGFloat = 1.0 / 8
             let newMag = v.mag + max(-step, min(step, targetMag - v.mag))
-            let newHide = v.hidden + max(-step * 0.8, min(step * 0.8, targetHide - v.hidden))
-            if newMag != v.mag || newHide != v.hidden { busy = true }
+            let newHide = v.hideAmount + max(-step * 0.8, min(step * 0.8, targetHide - v.hideAmount))
+            if newMag != v.mag || newHide != v.hideAmount { busy = true }
             v.mag = newMag
-            v.hidden = newHide
+            v.hideAmount = newHide
             v.relayout()
         }
         bounces = bounces.filter { now.timeIntervalSince($0.value) < 1.3 }
