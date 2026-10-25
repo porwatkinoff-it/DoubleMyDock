@@ -1621,16 +1621,43 @@ final class Controller: NSObject {
     // MARK: меню
 
     /// Правый клик. Меню значка берётся у настоящего Дока в фоне и показывается, когда готово.
+    /// Пустое место и разделители — как у Дока (меню настроек Дока) + внизу «DoubleMyDock ▸».
     func showContextMenu(for index: Int?, at p: CGPoint, in view: DockView, event: NSEvent) {
-        guard let index, index < items.count else {
-            NSMenu.popUpContextMenu(appMenu(), with: event, for: view)
+        let clicked: Item? = index.flatMap { $0 < items.count ? items[$0] : nil }
+        let onEmpty = clicked == nil || clicked?.kind == .separator || clicked?.kind == .spacer
+
+        if onEmpty {
+            let sep = (clicked?.kind == .separator ? clicked : nil) ?? items.first { $0.kind == .separator }
+            guard axTrusted, let sep, sep.axIndex >= 0 else {
+                NSMenu.popUpContextMenu(appMenu(), with: event, for: view)
+                return
+            }
+            requestDockMenu(for: sep, at: p, in: view) { [unowned self] nodes in
+                guard let nodes else { return self.appMenu() }
+                let m = self.mirrorMenu(nodes, item: sep)
+                m.addItem(.separator())
+                let title = self.updater.available.map { "DoubleMyDock — доступно обновление \($0.version)" } ?? "DoubleMyDock"
+                let sub = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                sub.submenu = self.appMenu()
+                m.addItem(sub)
+                return m
+            }
             return
         }
-        let it = items[index]
+
+        guard let it = clicked else { return }
         guard axTrusted, it.axIndex >= 0 else {
             NSMenu.popUpContextMenu(fallbackMenu(for: it), with: event, for: view)
             return
         }
+        requestDockMenu(for: it, at: p, in: view) { [unowned self] nodes in
+            nodes.map { self.mirrorMenu($0, item: it) } ?? self.fallbackMenu(for: it)
+        }
+    }
+
+    /// Читает меню у настоящего Дока в фоне и показывает собранное меню, когда оно готово.
+    private func requestDockMenu(for it: Item, at p: CGPoint, in view: DockView,
+                                 build: @escaping @MainActor ([DockReader.MenuNode]?) -> NSMenu) {
         menuRequest += 1
         let req = menuRequest, started = Date()
         monitor.readMenu(for: it) { [weak self, weak view] nodes in
@@ -1638,14 +1665,9 @@ final class Controller: NSObject {
                 guard let self, let view, req == self.menuRequest else { return }
                 let dt = Int(Date().timeIntervalSince(started) * 1000)
                 guard dt < 2000 else { return }     // слишком поздно — пользователь уже ушёл
-                let menu: NSMenu
-                if let nodes {
-                    menu = self.mirrorMenu(nodes, item: it)
-                    if dt > 400 { dlog("Меню «\(it.title)» читалось \(dt) мс") }
-                } else {
-                    menu = self.fallbackMenu(for: it)
-                    dlog("Меню «\(it.title)» не прочиталось за \(dt) мс — показано упрощённое")
-                }
+                if nodes == nil { dlog("Меню «\(it.title)» не прочиталось за \(dt) мс — показано своё") }
+                else if dt > 400 { dlog("Меню «\(it.title)» читалось \(dt) мс") }
+                let menu = build(nodes)
                 // показываем из цикла событий, а не из очереди, чтобы копия не замирала, пока меню открыто
                 RunLoop.main.perform {
                     MainActor.assumeIsolated { _ = menu.popUp(positioning: nil, at: p, in: view) }
