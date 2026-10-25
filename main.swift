@@ -1057,15 +1057,21 @@ final class Controller: NSObject {
         dlog("Экраны: " + list.joined(separator: ", "))
     }
 
-    /// Экран, на котором лежит бо́льшая часть прямоугольника (в Cocoa-координатах).
-    private func screenMostlyContaining(_ r: CGRect) -> NSScreen? {
+    /// Экран, на котором Док стоит на своём месте: целиком на экране и прижат к его краю.
+    /// Спрятанный Док (автоскрытие, полноэкранная программа) macOS сдвигает за край экрана —
+    /// если ниже стоит другой монитор, он «попадает» на его верх. Такой Док не засчитываем.
+    private func anchoredScreen(_ r: CGRect, orientation: Orientation) -> NSScreen? {
         guard r.width > 1, r.height > 1 else { return nil }
-        var best: NSScreen?, bestArea: CGFloat = 0
         for s in NSScreen.screens {
-            let i = s.frame.intersection(r)
-            if !i.isNull, i.width * i.height > bestArea { bestArea = i.width * i.height; best = s }
+            let f = s.frame
+            guard f.insetBy(dx: -2, dy: -2).contains(r) else { continue }
+            switch orientation {
+            case .bottom: if r.minY - f.minY <= 60 { return s }
+            case .left:   if r.minX - f.minX <= 60 { return s }
+            case .right:  if f.maxX - r.maxX <= 60 { return s }
+            }
         }
-        return bestArea >= r.width * r.height * 0.4 ? best : nil
+        return nil
     }
 
     private func visibleFrameDockScreen() -> CGDirectDisplayID? {
@@ -1081,7 +1087,7 @@ final class Controller: NSObject {
         var found = Set<CGDirectDisplayID>()
         for w in wins where w.owner == "Dock" && w.layer == dockLevel {
             let c = flip(w.bounds)
-            guard let s = NSScreen.screens.first(where: { $0.frame.contains(CGPoint(x: c.midX, y: c.midY)) }) else { continue }
+            guard let s = NSScreen.screens.first(where: { $0.frame.insetBy(dx: -2, dy: -2).contains(c) }) else { continue }
             let f = s.frame
             let ok: Bool
             switch orientation {
@@ -1110,7 +1116,7 @@ final class Controller: NSObject {
         if let ax = s.ax {
             newItems = ax.items
             let cocoaList = flip(ax.list)
-            let scr = screenMostlyContaining(cocoaList)
+            let scr = anchoredScreen(cocoaList, orientation: p.orientation)
             axScreen = scr.map(displayID)
             newGeo = geometryFromAX(ax, prefs: p, screen: scr, cocoaList: cocoaList)
         } else {
