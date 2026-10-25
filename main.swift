@@ -135,6 +135,7 @@ struct WinInfo {
     var owner: String
     var bounds: CGRect     // в координатах CG (от левого верхнего угла основного экрана)
     var alpha: Double
+    var fullscreen = false // окно в полноэкранном режиме (спрошено у самого окна)
 }
 
 struct Snapshot {
@@ -313,6 +314,21 @@ final class DockReader {
 
     // MARK: окна других программ
 
+    /// Спрашивает у окна, в полноэкранном ли оно режиме. По размеру этого не понять:
+    /// на MacBook с «чёлкой» полноэкранное окно стоит ниже неё и выглядит как развёрнутое.
+    func isFullScreen(pid: pid_t, frame old: CGRect) -> Bool {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.3)
+        guard let wins = copy(app, kAXWindowsAttribute) as? [AXUIElement] else { return false }
+        for w in wins {
+            guard let f = frame(w),
+                  abs(f.minX - old.minX) < 4, abs(f.minY - old.minY) < 4,
+                  abs(f.width - old.width) < 4, abs(f.height - old.height) < 4 else { continue }
+            return (copy(w, "AXFullScreen") as? NSNumber)?.boolValue ?? false
+        }
+        return false
+    }
+
     /// Меняет рамку окна программы (как делает macOS, чтобы окно не заходило под Док).
     func resizeWindow(pid: pid_t, from old: CGRect, to new: CGRect) -> Bool {
         let app = AXUIElementCreateApplication(pid)
@@ -350,6 +366,7 @@ final class DockMonitor {
     private var lastAX: AXSnapshot?
     private var axFailures = 0
     private let dockLevel = Int(CGWindowLevelForKey(.dockWindow))
+    private var fsCache: [String: (value: Bool, at: CFAbsoluteTime)] = [:]
 
     func start() {
         let t = DispatchSource.makeTimerSource(queue: queue)
@@ -364,7 +381,7 @@ final class DockMonitor {
 
     private func cycle(full: Bool) {
         tick += 1
-        let windows = readWindows()
+        var windows = readWindows()
 
         if full || tick % 6 == 1 {
             let t = AXIsProcessTrusted()
@@ -389,6 +406,8 @@ final class DockMonitor {
             let dt = CFAbsoluteTimeGetCurrent() - t0
             if dt > 0.25 { dlog(String(format: "Чтение Дока заняло %.0f мс", dt * 1000)) }
         }
+
+        if trusted { markFullscreen(&windows) }
 
         // сторож: если главный поток где-то застрял, это попадёт в журнал
         if tick % 4 == 0 {
@@ -421,6 +440,30 @@ final class DockMonitor {
                                alpha: (w[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1))
         }
         return out
+    }
+
+    /// Отмечает полноэкранные окна. Спрашиваем только большие окна, ответ запоминаем на 10 с.
+    private func markFullscreen(_ wins: inout [WinInfo]) {
+        var count: UInt32 = 0
+        CGGetActiveDisplayList(0, nil, &count)
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        CGGetActiveDisplayList(count, &ids, &count)
+        let displays = ids.prefix(Int(count)).map { CGDisplayBounds($0) }
+        let now = CFAbsoluteTimeGetCurrent()
+        fsCache = fsCache.filter { now - $0.value.at < 10 }
+        for i in wins.indices where wins[i].layer == 0 {
+            let b = wins[i].bounds
+            guard let d = displays.first(where: { $0.contains(CGPoint(x: b.midX, y: b.midY)) }),
+                  b.width >= d.width * 0.95, b.height >= d.height * 0.8 else { continue }
+            let key = "\(wins[i].pid):\(Int(b.minX)),\(Int(b.minY)),\(Int(b.width)),\(Int(b.height))"
+            if let c = fsCache[key] {
+                wins[i].fullscreen = c.value
+            } else {
+                let v = reader.isFullScreen(pid: wins[i].pid, frame: b)
+                fsCache[key] = (v, now)
+                wins[i].fullscreen = v
+            }
+        }
     }
 
     /// Полна ли Корзина: число записей в папке, без чтения её содержимого.
@@ -1432,7 +1475,12 @@ final class Controller: NSObject {
         var full = Set<CGDirectDisplayID>(), who: [CGDirectDisplayID: String] = [:]
         for s in NSScreen.screens {
             let target = s.frame.insetBy(dx: 4, dy: 4)
-            if let w = wins.first(where: { isUserWindow($0) && flip($0.bounds).contains(target) }) {
+            if let w = wins.first(where: { w in
+                guard isUserWindow(w) else { return false }
+                let r = flip(w.bounds)
+                if r.contains(target) { return true }               // окно ровно во весь экран
+                return w.fullscreen && s.frame.contains(CGPoint(x: r.midX, y: r.midY))
+            }) {
                 let id = displayID(s)
                 full.insert(id)
                 who[id] = appNames[w.pid] ?? w.owner
@@ -1456,7 +1504,7 @@ final class Controller: NSObject {
         for (id, m) in mirrors where m.panel.isVisible && !autoHide(id) {
             guard let s = screen(id) else { continue }
             let f = s.frame, vf = s.visibleFrame
-            for w in wins where isUserWindow(w) {
+            for w in wins where isUserWindow(w) && !w.fullscreen {
                 let r = flip(w.bounds)
                 guard f.contains(CGPoint(x: r.midX, y: r.midY)) else { continue }
                 var target = r
